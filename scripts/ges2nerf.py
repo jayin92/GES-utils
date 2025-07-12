@@ -47,21 +47,24 @@ def ges_to_json(recon_dir, output_dir, holdout):
     with open(os.path.join(recon_dir, "tracking.json"), "rb") as f:
         raw_tracking_data = json.load(f)
 
-    w     = raw_tracking_data["width"]
-    h     = raw_tracking_data["height"]
-    lon   = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][0]["value"]["relative"]
-    lat   = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][1]["value"]["relative"]
-    alt   = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][2]["value"]["value"]
+    w       = raw_tracking_data["width"]
+    h       = raw_tracking_data["height"]
+    lon     = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][0]["value"]["relative"]
+    lat     = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][1]["value"]["relative"]
+    alt     = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][2]["value"]["relative"]
+    alt_min = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][2]["value"]["minValueRange"]
+    alt_max = raw_tracking_data["trackPoints"][0]["coordinate"]["position"]["attributes"][2]["value"]["maxValueRange"]
     fov_v = raw_tracking_data["cameraFrames"][0]["fovVertical"]
 
     lat0 = 180 * lat - 90
     lon0 = 360 * lon - 180
-    alt0 = alt
+    alt0 = (alt_max - alt_min) * alt + alt_min
+    print(f"lat0: {lat0}, lon0: {lon0}, alt0: {alt0}")
 
     rot = rot_ecef2enu(lat0, lon0)
 
     theta_v_rad = math.radians(fov_v)
-    extrinsics = {
+    intrinsic = {
         "w": w,
         "h": h,
         "k1": 0,
@@ -70,10 +73,10 @@ def ges_to_json(recon_dir, output_dir, holdout):
         "p2": 0,
     }
 
-    extrinsics["fl_x"] = h / (2 * math.tan(theta_v_rad / 2))
-    extrinsics["fl_y"] = h / (2 * math.tan(theta_v_rad / 2))
-    extrinsics["cx"] = w / 2
-    extrinsics["cy"] = h / 2
+    intrinsic["fl_x"] = h / (2 * math.tan(theta_v_rad / 2))
+    intrinsic["fl_y"] = h / (2 * math.tan(theta_v_rad / 2))
+    intrinsic["cx"] = w / 2
+    intrinsic["cy"] = h / 2
 
     frames = []
     positions = []
@@ -92,7 +95,7 @@ def ges_to_json(recon_dir, output_dir, holdout):
             [np.zeros((1, 3)), 1]
         ])
         
-        c2w[0:3, 1:3] *= -1
+        # c2w[0:3, 1:3] *= -1
         # c2w = c2w[[1,0,2,3],:]
         # c2w[2,:] *= -1 # flip whole world upside down
         # c2w = c2w[np.array([1, 0, 2, 3]), :]
@@ -100,7 +103,7 @@ def ges_to_json(recon_dir, output_dir, holdout):
         # c2w[1:3, 0:3] *= -1
         print(c2w)
         frame = {
-            "file_path": f"images/frame{i}.jpg",
+            "file_path": f"images/frame_{i:04}.jpg",
             "transform_matrix": c2w.tolist(),
             "frame_id": i
         }
@@ -109,9 +112,9 @@ def ges_to_json(recon_dir, output_dir, holdout):
 
     # import ipdb
     # ipdb.set_trace()
-    out = dict(extrinsics)
-    out_train = dict(extrinsics)
-    out_test = dict(extrinsics)
+    out = dict(intrinsic)
+    out_train = dict(intrinsic)
+    out_test = dict(intrinsic)
 
     frames_train = [f for i, f in enumerate(frames) if i % holdout != 0]
     frames_test = [f for i, f in enumerate(frames) if i % holdout == 0]

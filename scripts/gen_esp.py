@@ -2,6 +2,7 @@ import argparse
 import json
 import pymap3d
 import numpy as np
+import math
 
 from geopy.distance import geodesic
 from geopy.point import Point
@@ -29,8 +30,30 @@ def get_coordinates(lat, lon, offset, sample):
 
     return coordinates
     
+
+def get_coordinates_center(lat, lon, offset, sample):
+    # lat lon is now the center point
+    # therefore, we need to calculate the bottom left corner and top right corner
+    center_to_corner = offset * math.sqrt(2) / 2  # Convert to half offset for center point calculation
+    bottom_left = geodesic(kilometers=center_to_corner).destination(Point(lat, lon), 225)
+    top_right = geodesic(kilometers=center_to_corner).destination(Point(lat, lon), 45)
+
+    lat_0 = bottom_left.latitude
+    lon_0 = bottom_left.longitude
+    lat_1 = top_right.latitude
+    lon_1 = top_right.longitude
     
-    # Calculate the coordinates
+    print(f"Square side length: {offset} km")
+    print(f"Center: ({lat}, {lon})")
+    print(f"Bottom left: ({lat_0:.6f}, {lon_0:.6f})")
+    print(f"Top right: ({lat_1:.6f}, {lon_1:.6f})")
+
+    X, Y = np.meshgrid(np.linspace(lat_0, lat_1, sample), np.linspace(lon_0, lon_1, sample))
+    coordinates = np.vstack([X.ravel(), Y.ravel()]).T
+    
+    print(coordinates.shape)
+
+    return coordinates
 
 def convert_to_relative(coordinates, altitude, tilt):
     # Define the MinValueRange and MaxValueRange for each dimension
@@ -222,16 +245,20 @@ def write_to_esp_file(esp_content, output_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate TrackPoints.esp file from XML coordinates.')
-    parser.add_argument('--lat', type=float, help='Bottom left Latitude', required=True)
-    parser.add_argument('--lon', type=float, help='Bottom right Longitude', required=True)
+    parser.add_argument('--lat', type=float, help='Bottom left/center Latitude', required=True)
+    parser.add_argument('--lon', type=float, help='Bottom left/center Longitude', required=True)
     parser.add_argument('--alt', type=float, help='Altitude in meter', required=True)
     parser.add_argument('--tilt', type=float, help='Tilt in degree (0 ~ 180)', required=True)
     parser.add_argument('--offset', type=float, help='Cover range in km', required=True)
     parser.add_argument('--sample', type=int, help='Number of samples in one dimesion', default=10)
     parser.add_argument('--output', type=str, help='Output file', required=True)
+    parser.add_argument('--center', action='store_true', help='Use center point instead of bottom left corner')
     args = parser.parse_args()
 
-    coordinates = get_coordinates(args.lat, args.lon, args.offset, args.sample)
+    if args.center:
+        coordinates = get_coordinates_center(args.lat, args.lon, args.offset, args.sample)
+    else:
+        coordinates = get_coordinates(args.lat, args.lon, args.offset, args.sample)
     keyframes_longitude, keyframes_latitude, keyframes_altitude, keyframes_rotationX, keyframes_rotationY = convert_to_relative(coordinates, args.alt, args.tilt)
     esp_content = generate_esp_content(args.lat, args.lon, args.offset, keyframes_longitude, keyframes_latitude, keyframes_altitude, keyframes_rotationX, keyframes_rotationY)
     write_to_esp_file(esp_content, args.output)

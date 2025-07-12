@@ -91,7 +91,7 @@ def ges_to_json(recon_dir, output_dir, holdout):
         rx, ry, rz = frame['rotation']['x'], frame['rotation']['y'], frame['rotation']['z']
         R = compute_w2c_ecef(rx, ry, rz)
         c2w = np.block([
-            [rot @ R, np.array([x, y, z]).reshape(-1, 1) / 1000],
+            [rot @ R, np.array([x, y, z]).reshape(-1, 1)],
             [np.zeros((1, 3)), 1]
         ])
         

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate 3D point cloud using COLMAP with known camera poses from transforms.json
+FIXED VERSION - addresses coordinate system, path fixing, and error handling issues
 """
 
 import os
@@ -9,10 +10,72 @@ import numpy as np
 import argparse
 from pathlib import Path
 
+def validate_and_fix_images(transforms_json_path, images_dir):
+    """
+    Validate that all images referenced in transforms.json exist
+    and fix any path mismatches
+    """
+    with open(transforms_json_path, 'r') as f:
+        transforms = json.load(f)
+    
+    print("Validating image files...")
+    missing_images = []
+    fixed_paths = {}
+    
+    for i, frame in enumerate(transforms['frames']):
+        original_path = frame['file_path']
+        image_name = os.path.basename(original_path)
+        
+        # Remove extension and try different ones
+        base_name = os.path.splitext(image_name)[0]
+        
+        # Try exact match first
+        test_path = images_dir / image_name
+        if test_path.exists():
+            continue
+            
+        # Try different extensions
+        found = False
+        for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+            test_path = images_dir / (base_name + ext)
+            if test_path.exists():
+                fixed_paths[i] = base_name + ext  # Store by frame index
+                found = True
+                break
+        
+        if not found:
+            missing_images.append(original_path)
+    
+    if missing_images:
+        print(f"ERROR: {len(missing_images)} images not found:")
+        for img in missing_images[:5]:  # Show first 5
+            print(f"  - {img}")
+        if len(missing_images) > 5:
+            print(f"  ... and {len(missing_images) - 5} more")
+        
+        # Option to continue or abort
+        response = input("Continue anyway? (y/n): ").lower()
+        if response != 'y':
+            print("Aborting. Please check your image paths.")
+            return None
+    
+    if fixed_paths:
+        print(f"Fixed {len(fixed_paths)} image path mismatches")
+    
+    return fixed_paths
+
+
 def transforms_to_colmap(transforms_json_path, output_path, colmap_executable="colmap"):
     """
     Convert transforms.json to COLMAP format and generate point cloud
     """
+    
+    images_dir = Path(output_path) / "images"
+    
+    # Validate images first
+    fixed_paths = validate_and_fix_images(transforms_json_path, images_dir)
+    if fixed_paths is None:  # User chose to abort
+        return False
     
     # Load transforms.json
     with open(transforms_json_path, 'r') as f:
@@ -21,8 +84,6 @@ def transforms_to_colmap(transforms_json_path, output_path, colmap_executable="c
     # Create output directories
     sparse_dir = Path(output_path) / "sparse" / "0"
     sparse_dir.mkdir(parents=True, exist_ok=True)
-    
-    images_dir = Path(output_path) / "images"
     
     # Extract camera parameters
     if 'fl_x' in transforms and 'fl_y' in transforms:
@@ -66,7 +127,6 @@ def transforms_to_colmap(transforms_json_path, output_path, colmap_executable="c
             # NeRF: +X right, +Y up, +Z backward (into screen)
             # COLMAP: +X right, +Y down, +Z forward (out of screen)
             
-            # Flip Y and Z axes for coordinate system conversion
             # c2w[1:3] *= -1
             
             # Convert from camera-to-world (c2w) to world-to-camera (w2c)
@@ -80,10 +140,16 @@ def transforms_to_colmap(transforms_json_path, output_path, colmap_executable="c
             # Convert rotation matrix to quaternion
             qw, qx, qy, qz = rotation_matrix_to_quaternion(R)
             
-            # Get image filename
-            image_name = frame['file_path']
-            if not image_name.endswith(('.jpg', '.jpeg', '.png')):
-                image_name += '.jpg'  # assume jpg if no extension
+            # Get image filename - use fixed path if available
+            if i in fixed_paths:
+                image_name = fixed_paths[i]
+            else:
+                image_name = os.path.basename(frame['file_path'])
+                
+                # Ensure proper extension if not in fixed_paths
+                if not image_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    base_name = os.path.splitext(image_name)[0]
+                    image_name = base_name + '.jpg'  # default fallback
             
             # Write image entry
             image_id = i + 1
@@ -100,7 +166,7 @@ def transforms_to_colmap(transforms_json_path, output_path, colmap_executable="c
     print(f"COLMAP files written to {sparse_dir}")
     
     # Now run COLMAP to generate the point cloud
-    generate_point_cloud(output_path, colmap_executable)
+    return generate_point_cloud(output_path, colmap_executable)
 
 def rotation_matrix_to_quaternion(R):
     """Convert rotation matrix to quaternion (w, x, y, z)"""
@@ -176,16 +242,18 @@ def generate_point_cloud(source_path, colmap_executable="colmap", use_gpu=True):
         print(f"Point triangulation failed with code {exit_code}")
         return False
     
-    print("Step 4: Bundle adjustment (optional refinement)...")
-    # Optional: Bundle adjustment to refine the points
-    ba_cmd = f"""{colmap_command} bundle_adjuster \
+    print("Step 4: Convert .bin to .txt")
+    # Convert points3D.bin to points3D.txt
+    convert_cmd = f"""{colmap_command} model_converter \
         --input_path {source_path}/sparse/0 \
-        --output_path {source_path}/sparse/0"""
+        --output_path {source_path}/sparse/0 \
+        --output_type TXT"""
     
-    exit_code = os.system(ba_cmd)
+    exit_code = os.system(convert_cmd)
     if exit_code != 0:
-        print(f"Bundle adjustment failed with code {exit_code}, but points should still be generated")
-    
+        print(f"Model conversion failed with code {exit_code}")
+        return False
+
     print(f"Point cloud generation complete! Check {source_path}/sparse/0/points3D.txt")
     return True
 
@@ -203,11 +271,18 @@ def main():
     args = parser.parse_args()
     
     # Convert transforms.json to COLMAP format and generate point cloud
-    transforms_to_colmap(
+    success = transforms_to_colmap(
         args.transforms_json, 
         args.output_path, 
         args.colmap_executable
     )
+    
+    if not success:
+        print("COLMAP generation failed!")
+        exit(1)
+    else:
+        print("COLMAP generation completed successfully!")
+        exit(0)
 
 if __name__ == "__main__":
     main()

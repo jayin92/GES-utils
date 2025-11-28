@@ -162,3 +162,5 @@ cython_debug/
 
 *.esp
 *.kml
+
+tokyo_tower*

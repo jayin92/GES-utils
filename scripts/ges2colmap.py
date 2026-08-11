@@ -9,6 +9,16 @@ Replaces the old two-step ges2nerf.py -> transform_to_colmap.py pipeline.
       -> transforms.json / transforms_train.json / transforms_test.json  (NeRF)
       -> sparse/0/{cameras,images,points3D}.txt + triangulated points     (COLMAP / 3DGS)
 
+Point it at a dataset folder and everything else is inferred:
+
+    python scripts/ges2colmap.py /path/to/times_square
+
+A raw GES export unzips to <project>.json (named after the project, *not*
+tracking.json) plus footage/<project>_<idx>.jpeg, so the tracking JSON is found
+by name or by being the only non-transforms .json in the folder, and the images
+are found in footage/ (or images/). Output lands in the same folder unless
+--output_dir says otherwise.
+
 COORDINATE CONVENTION -- READ BEFORE EDITING
 --------------------------------------------
 The poses written here are ALREADY in COLMAP / OpenCV convention
@@ -22,6 +32,8 @@ decision, not as code waiting to be re-enabled.
 import argparse
 import json
 import math
+import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -35,12 +47,148 @@ from tqdm import tqdm
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
+# Directories a raw GES export / a merged dataset keeps its frames in, in the
+# order they are probed. GES names the render output folder "footage".
+IMAGE_DIR_NAMES = ("footage", "images")
+
+# Trailing digits of a stem: both GES's "<project>_07" and merge_image.py's
+# "frame_0007" resolve to frame 7 through this.
+TRAILING_INDEX = re.compile(r"(\d+)$")
+
 MATCHERS = {
     "exhaustive": "exhaustive_matcher",
     "sequential": "sequential_matcher",
     "vocab_tree": "vocab_tree_matcher",
     "spatial": "spatial_matcher",
 }
+
+
+# --------------------------------------------------------------------------
+# locating the export's pieces
+# --------------------------------------------------------------------------
+
+
+def resolve_tracking_path(target):
+    """
+    Find the 3D Tracking JSON given a file or a dataset folder.
+
+    A raw GES export names it after the project ("Untitled.json"), not
+    "tracking.json", so fall back to "the only .json in the folder". The
+    transforms*.json this script writes are excluded, otherwise a second run
+    over its own output would see four candidates and give up.
+    """
+    path = Path(target)
+
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise SystemExit(f"Error: {path} not found")
+
+    named = path / "tracking.json"
+    if named.is_file():
+        return named
+
+    candidates = sorted(
+        p
+        for p in path.glob("*.json")
+        if p.is_file() and not p.name.startswith("transforms")
+    )
+    if len(candidates) == 1:
+        print(f"Using {candidates[0].name} as the tracking export.")
+        return candidates[0]
+    if not candidates:
+        raise SystemExit(f"Error: no tracking JSON found in {path}")
+    raise SystemExit(
+        f"Error: {len(candidates)} candidate JSON files in {path} "
+        f"({', '.join(p.name for p in candidates)}). "
+        f"Pass the tracking JSON directly."
+    )
+
+
+def has_images(directory):
+    return directory.is_dir() and any(
+        p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES for p in directory.iterdir()
+    )
+
+
+def resolve_images_dir(explicit, input_dir, output_dir):
+    """Locate the frames: <input>/footage for a raw export, <output>/images after merging."""
+    if explicit:
+        return Path(explicit)
+
+    for parent in (input_dir, output_dir):
+        for name in IMAGE_DIR_NAMES:
+            candidate = parent / name
+            if has_images(candidate):
+                return candidate
+
+    return output_dir / "images"
+
+
+def frame_index_of(stem):
+    match = TRAILING_INDEX.search(stem)
+    return int(match.group(1)) if match else None
+
+
+def map_frames_to_images(n_frames, images_dir, allow_missing):
+    """
+    Map each cameraFrames index to the filename that actually exists on disk.
+
+    Frame index must match render order, so the mapping goes through the
+    numeric suffix of the filename rather than through sort position: GES emits
+    "<project>_7.jpeg" while merge_image.py emits "frame_0007.jpg", and both
+    mean frame 7. Some GES exports start numbering at 1, so a uniform +1 offset
+    is detected and undone instead of silently shifting every pose by a frame.
+    """
+    if not images_dir.is_dir():
+        print(f"Image directory {images_dir} does not exist.")
+        found = {}
+    else:
+        found = {}
+        collisions = {}
+        for path in sorted(images_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            index = frame_index_of(path.stem)
+            if index is None:
+                continue
+            if index in found:
+                collisions.setdefault(index, [found[index]]).append(path.name)
+                continue
+            found[index] = path.name
+
+        if collisions:
+            examples = list(collisions.items())[:5]
+            raise SystemExit(
+                "Error: several images claim the same frame index in "
+                f"{images_dir}, e.g. "
+                + "; ".join(f"{i}: {', '.join(names)}" for i, names in examples)
+                + ". Remove the duplicates or pass --images with a clean folder."
+            )
+
+    # Pick whichever offset leaves fewer holes; ties go to 0-based.
+    offsets = {off: sum(1 for i in range(n_frames) if i + off in found) for off in (0, 1)}
+    offset = 1 if offsets[1] > offsets[0] else 0
+    if offset:
+        print("Images are numbered from 1; mapping frame i to image i+1.")
+
+    resolved = {i: found[i + offset] for i in range(n_frames) if i + offset in found}
+    missing = [i for i in range(n_frames) if i not in resolved]
+
+    if missing:
+        print(f"\n{len(missing)} of {n_frames} frame(s) have no image in {images_dir}:")
+        for index in missing[:10]:
+            print(f"  - frame {index}")
+        if len(missing) > 10:
+            print(f"  ... and {len(missing) - 10} more")
+        if not allow_missing:
+            raise SystemExit(
+                "Aborting. Pass --allow-missing-images to continue with the "
+                "images that are present."
+            )
+        print("Continuing without them (--allow-missing-images).")
+
+    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -214,15 +362,27 @@ def resolve_intrinsics(render_w, render_h, fov_v, images_dir):
 # --------------------------------------------------------------------------
 
 
-def write_transforms(intrinsics, poses, output_dir, holdout):
-    """Write transforms.json plus the train/test split used by NeRF training."""
+def write_transforms(intrinsics, poses, output_dir, images_dir, image_names, holdout):
+    """
+    Write transforms.json plus the train/test split used by NeRF training.
+
+    file_path is the real filename under images_dir, made relative to
+    output_dir -- a raw GES export gives "footage/Untitled_0007.jpeg" where a
+    merged dataset gives "images/frame_0007.jpg". Frames without an image are
+    dropped rather than pointing at a file that is not there; frame_id keeps
+    the original cameraFrames index so the drop is visible downstream.
+    """
+    prefix = Path(os.path.relpath(images_dir, output_dir)).as_posix()
+    prefix = "" if prefix == "." else prefix + "/"
+
     frames = [
         {
-            "file_path": f"images/frame_{i:04}.jpg",
+            "file_path": prefix + image_names[i],
             "transform_matrix": c2w.tolist(),
             "frame_id": i,
         }
         for i, c2w in enumerate(poses)
+        if i in image_names
     ]
 
     splits = {
@@ -230,6 +390,7 @@ def write_transforms(intrinsics, poses, output_dir, holdout):
         "transforms_train.json": [f for i, f in enumerate(frames) if i % holdout != 0],
         "transforms_test.json": [f for i, f in enumerate(frames) if i % holdout == 0],
     }
+
 
     for name, split_frames in splits.items():
         out = dict(intrinsics)
@@ -244,56 +405,6 @@ def write_transforms(intrinsics, poses, output_dir, holdout):
     )
 
     return frames
-
-
-# --------------------------------------------------------------------------
-# images on disk
-# --------------------------------------------------------------------------
-
-
-def resolve_image_names(frames, images_dir, allow_missing):
-    """
-    Map each frame to the filename that actually exists in images_dir.
-
-    GES exports .jpeg while transforms.json names .jpg, so fall back across
-    extensions before giving up. Unlike the old transform_to_colmap.py this
-    never prompts -- it fails with the list of missing files, or skips them
-    when explicitly allowed.
-    """
-    resolved = {}
-    missing = []
-
-    for i, frame in enumerate(frames):
-        name = Path(frame["file_path"]).name
-        if (images_dir / name).exists():
-            resolved[i] = name
-            continue
-
-        stem = Path(name).stem
-        for suffix in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
-            if (images_dir / (stem + suffix)).exists():
-                resolved[i] = stem + suffix
-                break
-        else:
-            missing.append(name)
-
-    if missing:
-        print(
-            f"\n{len(missing)} image(s) referenced by transforms.json are missing "
-            f"from {images_dir}:"
-        )
-        for name in missing[:10]:
-            print(f"  - {name}")
-        if len(missing) > 10:
-            print(f"  ... and {len(missing) - 10} more")
-        if not allow_missing:
-            raise SystemExit(
-                "Aborting. Pass --allow-missing-images to triangulate "
-                "from the images that are present."
-            )
-        print("Continuing without them (--allow-missing-images).")
-
-    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -345,9 +456,7 @@ def c2w_to_colmap(c2w):
     return qw, qx, qy, qz, t_w2c
 
 
-def write_colmap_model(
-    sparse_dir, intrinsics, frames, image_names, name_to_id, camera_id
-):
+def write_colmap_model(sparse_dir, intrinsics, frames, name_to_id, camera_id):
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     with open(sparse_dir / "cameras.txt", "w") as f:
@@ -363,10 +472,9 @@ def write_colmap_model(
     written = 0
     unknown = []
     lines = []
-    for i, frame in enumerate(frames):
-        name = image_names.get(i)
-        if name is None:
-            continue
+    for frame in frames:
+        # COLMAP names images relative to --image_path, i.e. the basename here.
+        name = Path(frame["file_path"]).name
         image_id = name_to_id.get(name)
         if image_id is None:
             unknown.append(name)
@@ -494,17 +602,26 @@ def main():
         "triangulated COLMAP model."
     )
     parser.add_argument(
+        "input",
+        nargs="?",
+        help="Dataset folder (a raw GES export works as-is), or the tracking JSON",
+    )
+    parser.add_argument(
         "--tracking",
-        required=True,
-        help="tracking.json, or the directory containing it",
+        default=None,
+        help="Same as the positional argument; kept for older invocations",
     )
     parser.add_argument(
         "--output_dir",
-        required=True,
-        help="Dataset root; receives transforms*.json, sparse/0 and database.db",
+        "--output",
+        default=None,
+        help="Receives transforms*.json, sparse/0 and database.db "
+        "(default: the input folder)",
     )
     parser.add_argument(
-        "--images", default=None, help="Image directory (default: <output_dir>/images)"
+        "--images",
+        default=None,
+        help="Image directory (default: footage/ or images/ under the dataset folder)",
     )
     parser.add_argument(
         "--holdout",
@@ -554,30 +671,51 @@ def main():
     if args.matcher == "vocab_tree" and not args.vocab_tree_path:
         parser.error("--matcher vocab_tree requires --vocab-tree-path")
 
-    tracking_path = Path(args.tracking)
-    if tracking_path.is_dir():
-        tracking_path = tracking_path / "tracking.json"
-    if not tracking_path.is_file():
-        raise SystemExit(f"Error: {tracking_path} not found")
+    target = args.input or args.tracking
+    if not target:
+        parser.error("give a dataset folder (or a tracking JSON) to convert")
 
-    output_dir = Path(args.output_dir)
+    tracking_path = resolve_tracking_path(target)
+    input_dir = tracking_path.parent
+
+    # One folder in, same folder out, unless told otherwise.
+    output_dir = Path(args.output_dir) if args.output_dir else input_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = Path(args.images) if args.images else output_dir / "images"
+    images_dir = resolve_images_dir(args.images, input_dir, output_dir)
+
+    print(f"Tracking: {tracking_path}")
+    print(f"Images:   {images_dir}")
+    print(f"Output:   {output_dir}")
 
     raw, origin, render_w, render_h, fov_v = load_tracking(tracking_path)
     print(f"World origin: lat0={origin[0]}, lon0={origin[1]}, alt0={origin[2]}")
 
     intrinsics = resolve_intrinsics(render_w, render_h, fov_v, images_dir)
     poses = build_poses(raw, origin)
-    frames = write_transforms(intrinsics, poses, output_dir, args.holdout)
+
+    # The mapping is needed before transforms*.json is written -- file_path
+    # names the image that is really on disk. COLMAP then gets every frame that
+    # has one; the holdout split only affects NeRF training.
+    image_names = map_frames_to_images(
+        len(poses), images_dir, args.allow_missing_images or args.transforms_only
+    )
+    if not image_names and args.transforms_only:
+        # Poses without renders: still useful on its own, so fall back to the
+        # naming merge_image.py will produce once the frames do exist.
+        print("No images on disk; naming frames images/frame_XXXX.jpg.")
+        images_dir = output_dir / "images"
+        image_names = {i: f"frame_{i:04}.jpg" for i in range(len(poses))}
+
+    frames = write_transforms(
+        intrinsics, poses, output_dir, images_dir, image_names, args.holdout
+    )
 
     if args.transforms_only:
         print("\n--transforms-only: skipping COLMAP.")
         return 0
 
-    # COLMAP is fed every frame. The holdout split only affects NeRF training;
-    # triangulation should use all available views.
-    image_names = resolve_image_names(frames, images_dir, args.allow_missing_images)
+    if not frames:
+        raise SystemExit(f"Error: no frames have an image in {images_dir}.")
 
     colmap = args.colmap_executable
     database = output_dir / "database.db"
@@ -597,9 +735,7 @@ def main():
         )
     else:
         name_to_id, camera_id = read_database_images(database)
-        write_colmap_model(
-            sparse_dir, intrinsics, frames, image_names, name_to_id, camera_id
-        )
+        write_colmap_model(sparse_dir, intrinsics, frames, name_to_id, camera_id)
 
     match_features(
         colmap, database, args.matcher, args.vocab_tree_path, use_gpu, args.dry_run

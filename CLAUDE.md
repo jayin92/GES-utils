@@ -13,9 +13,9 @@ Dependencies are installed ad hoc: `numpy`, `scipy`, `opencv-python`, `pymap3d`,
 The scripts are stages of one workflow; understanding the whole chain is necessary before editing any single stage.
 
 1. **`gen_esp.py`** → writes a `.esp` GES project file describing a grid of camera positions. Import into Google Earth Studio.
-2. GES renders the animation to an image sequence + a `tracking.json` (3D Tracking export). **Render twice** with the watermark in different corners.
+2. GES renders the animation to an image sequence + a 3D Tracking export. The download unzips to `<project>.json` (named after the project, *not* `tracking.json`) plus `footage/<project>_<idx>.jpeg`. **Render twice** with the watermark in different corners.
 3. **`merge_image.py`** (image folders) or **`prep_ges_datasets.py`** (videos) → composites the two renders to erase the watermark.
-4. **`ges2colmap.py`** → `tracking.json` → `transforms{,_train,_test}.json` → COLMAP sparse model with *known* poses → triangulated point cloud (needed by 3DGS). Formerly two scripts, `ges2nerf.py` and `transform_to_colmap.py`; both were deleted when they merged.
+4. **`ges2colmap.py`** → tracking JSON → `transforms{,_train,_test}.json` → COLMAP sparse model with *known* poses → triangulated point cloud (needed by 3DGS). Formerly two scripts, `ges2nerf.py` and `transform_to_colmap.py`; both were deleted when they merged.
 5. **`visualize_cam_poses.py`** → viser web viewer to sanity-check poses before training.
 
 `kml2esp.py` is a third-party alternative entry point (path-following animation from a KML LineString, © Pat Wilson) and is not part of the grid workflow.
@@ -49,11 +49,14 @@ Prefer `merge_image.py` for new work.
 
 ## Filename contract
 
-`ges2colmap.py` writes `file_path` as `images/frame_{i:04}.jpg`, where `i` is the index into `cameraFrames`. **Frame index must match render order** — any renaming or re-sorting between stages breaks the pose↔image correspondence.
+**Frame index must match render order** — any re-sorting between stages breaks the pose↔image correspondence. `ges2colmap.py` binds frame `i` of `cameraFrames` to an image through the **trailing digits of the filename**, not through sort position, so both naming schemes in play work untouched:
 
-`merge_image.py` already emits `frame_{i:04d}.jpg`. `rename_images.py` normalizes GES's raw `<name>_0001.jpeg` exports to the same form: `python scripts/rename_images.py <folder> [--dry-run] [--max-index N]`. It aborts without renaming anything if two sources would collide on one target or if a rename would overwrite an existing file.
+- raw GES export — `footage/<project>_07.jpeg`
+- merged dataset — `images/frame_0007.jpg` (what `merge_image.py` emits)
 
-`ges2colmap.py` resolves images relative to `<output_dir>/images` (override with `--images`), falling back across `.jpg`/`.jpeg`/`.png`. Missing images are a hard error listing the files; `--allow-missing-images` opts into triangulating without them. It never prompts, so it is safe to run unattended.
+`file_path` in `transforms*.json` is therefore the real filename on disk, written relative to `--output_dir` (`footage/Untitled_07.jpeg`, `images/frame_0007.jpg`, or `../ts/footage/...` when output lives elsewhere). Renaming is no longer required; `rename_images.py` still normalizes GES's `<name>_0001.jpeg` to `frame_{i:04d}.jpg` if you want one convention: `python scripts/rename_images.py <folder> [--dry-run] [--max-index N]`. It aborts without renaming anything if two sources would collide on one target or if a rename would overwrite an existing file.
+
+Some GES exports number from 1. `map_frames_to_images()` detects a uniform +1 offset (it tries both and keeps the one with fewer holes) rather than shifting every pose by a frame. Two files claiming the same index is a hard error — the mapping must be unambiguous. Frames with no image are dropped from `transforms*.json`, and `frame_id` keeps the original `cameraFrames` index so the gap stays visible; missing images are a hard error listing the frames unless `--allow-missing-images` is passed. It never prompts, so it is safe to run unattended.
 
 **Two COLMAP details that are easy to regress:**
 - **Image IDs must come from `database.db`**, not from the frame index. `read_database_images()` reads them after `feature_extractor` runs, which is why extraction happens *before* the model is written. The old `image_id = i + 1` coincidentally matched for a full `transforms.json` but mis-ID'd every image in a holdout subset.
@@ -74,9 +77,13 @@ python scripts/merge_image.py --left renders_a/ --right renders_b/ \
 # ...or from two videos
 python scripts/prep_ges_datasets.py --left a.mp4 --right b.mp4 --output dataset/images
 
-# 4. tracking.json -> transforms*.json -> COLMAP model + points (needs colmap on PATH)
-python scripts/ges2colmap.py --tracking dataset/ --output_dir dataset/ --holdout 50
-# --tracking takes tracking.json or its containing directory.
+# 4. tracking JSON -> transforms*.json -> COLMAP model + points (needs colmap on PATH)
+python scripts/ges2colmap.py dataset/ --holdout 50
+# One positional argument: a dataset folder (a raw GES export works as-is) or the
+# tracking JSON itself. Output goes to the same folder unless --output_dir says
+# otherwise; images are found in <folder>/footage or <folder>/images (--images).
+# The tracking JSON is tracking.json, or the only non-transforms .json present —
+# a raw export names it after the project (Untitled.json).
 # holdout N: every Nth frame goes to test, the rest to train. COLMAP always gets
 # all frames — the split only affects the NeRF outputs.
 # --transforms-only stops before COLMAP; --dry-run prints the colmap commands.
